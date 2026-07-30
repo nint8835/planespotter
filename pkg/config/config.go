@@ -25,6 +25,7 @@ type Config struct {
 	CCAREnabled            bool          `split_words:"true" default:"true"`
 	DiscordWebhookURL      string        `split_words:"true" required:"true"`
 	DiscordWebhookThreadID string        `split_words:"true"`
+	FlightAwareAPIKey      string        `split_words:"true"`
 }
 
 // Load loads .env, then populates Config from PLANESPOTTER_ environment variables.

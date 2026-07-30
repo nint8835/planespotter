@@ -9,6 +9,8 @@ import (
 
 	adsbdb "github.com/nint8835/go-adsbdb"
 
+	"github.com/nint8835/planespotter/pkg/diversion"
+	"github.com/nint8835/planespotter/pkg/flightaware"
 	"github.com/nint8835/planespotter/pkg/messaging"
 	"github.com/nint8835/planespotter/pkg/tar1090"
 )
@@ -523,5 +525,166 @@ func TestDiscordSenderReturnsErrorAfterRetryableResponsesExhaustAttempts(t *test
 	}
 	if requests != 3 {
 		t.Fatalf("requests = %d, want 3", requests)
+	}
+}
+
+func TestDiscordSenderRendersDivertingAircraft(t *testing.T) {
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	sender, err := messaging.NewDiscordSender(server.URL, "")
+	if err != nil {
+		t.Fatalf("NewDiscordSender() error = %v", err)
+	}
+
+	err = sender.SendAircraft(context.Background(), messaging.AircraftMessage{
+		Aircraft: tar1090.Aircraft{Hex: "c12345", Flight: "ABC123"},
+		Diversion: messaging.GeometricDiversion(&diversion.Diversion{
+			NearestAirport: adsbdb.Airport{IATACode: "YYZ", Municipality: "Toronto"},
+			DistanceNM:     196,
+			AltitudeFeet:   6000,
+		}),
+	})
+	if err != nil {
+		t.Fatalf("SendAircraft() error = %v", err)
+	}
+
+	embeds := gotPayload["embeds"].([]any)
+	embed := embeds[0].(map[string]any)
+	author := embed["author"].(map[string]any)
+	if author["name"] != "Aircraft possibly diverting" {
+		t.Fatalf("author name = %#v, want diversion label", author["name"])
+	}
+	if embed["color"] != float64(0xf2994a) {
+		t.Fatalf("embed color = %#v, want diversion orange", embed["color"])
+	}
+	assertEmbedField(
+		t,
+		embed["fields"].([]any),
+		"Possibly diverting",
+		"At 6000 ft, 196 nm from the nearest airport on its filed route: YYZ (Toronto)",
+	)
+}
+
+func TestDiscordSenderLabelsDivertingNewAircraftAsDiverting(t *testing.T) {
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	sender, err := messaging.NewDiscordSender(server.URL, "")
+	if err != nil {
+		t.Fatalf("NewDiscordSender() error = %v", err)
+	}
+
+	err = sender.SendAircraft(context.Background(), messaging.AircraftMessage{
+		Aircraft:  tar1090.Aircraft{Hex: "c12345", Flight: "ABC123", DBFlags: tar1090.DBFlagMilitary},
+		Diversion: messaging.GeometricDiversion(&diversion.Diversion{NearestAirport: adsbdb.Airport{IATACode: "YYZ"}}),
+	})
+	if err != nil {
+		t.Fatalf("SendAircraft() error = %v", err)
+	}
+
+	embeds := gotPayload["embeds"].([]any)
+	embed := embeds[0].(map[string]any)
+	author := embed["author"].(map[string]any)
+	if author["name"] != "Aircraft possibly diverting" {
+		t.Fatalf("author name = %#v, want diversion label even for a new aircraft", author["name"])
+	}
+	if embed["color"] != float64(0xf2994a) {
+		t.Fatalf("embed color = %#v, want diversion orange to outrank military red", embed["color"])
+	}
+}
+
+func TestDiscordSenderOmitsDiversionFieldForAircraftNotDiverting(t *testing.T) {
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	sender, err := messaging.NewDiscordSender(server.URL, "")
+	if err != nil {
+		t.Fatalf("NewDiscordSender() error = %v", err)
+	}
+
+	err = sender.SendAircraft(context.Background(), messaging.AircraftMessage{
+		Aircraft: tar1090.Aircraft{Hex: "c12345", Flight: "ABC123"},
+	})
+	if err != nil {
+		t.Fatalf("SendAircraft() error = %v", err)
+	}
+
+	embeds := gotPayload["embeds"].([]any)
+	embed := embeds[0].(map[string]any)
+	if embed["color"] != float64(0x2f80ed) {
+		t.Fatalf("embed color = %#v, want default blue", embed["color"])
+	}
+	for _, field := range embed["fields"].([]any) {
+		if field.(map[string]any)["name"] == "Possibly diverting" {
+			t.Fatalf("fields = %#v, want no diversion field", embed["fields"])
+		}
+	}
+}
+
+func TestDiscordSenderRendersFlightAwareDiversion(t *testing.T) {
+	var gotPayload map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Errorf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	sender, err := messaging.NewDiscordSender(server.URL, "")
+	if err != nil {
+		t.Fatalf("NewDiscordSender() error = %v", err)
+	}
+
+	err = sender.SendAircraft(context.Background(), messaging.AircraftMessage{
+		Aircraft: tar1090.Aircraft{Hex: "c12345", Flight: "ACA123"},
+		Diversion: messaging.FlightAwareDiversion(&flightaware.Flight{
+			Diverted:    true,
+			Origin:      &flightaware.Airport{CodeIATA: "YYT", City: "St. John's"},
+			Destination: &flightaware.Airport{CodeIATA: "YYZ", City: "Toronto"},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("SendAircraft() error = %v", err)
+	}
+
+	embeds := gotPayload["embeds"].([]any)
+	embed := embeds[0].(map[string]any)
+	if embed["color"] != float64(0xf2994a) {
+		t.Fatalf("embed color = %#v, want diversion orange", embed["color"])
+	}
+	assertEmbedField(
+		t,
+		embed["fields"].([]any),
+		"Possibly diverting",
+		"FlightAware reports this flight as diverted, filed YYT (St. John's) -> YYZ (Toronto)",
+	)
+}
+
+func TestFlightAwareDiversionIsNilWhenNotDiverted(t *testing.T) {
+	if got := messaging.FlightAwareDiversion(&flightaware.Flight{Diverted: false}); got != nil {
+		t.Fatalf("FlightAwareDiversion() = %#v, want nil", got)
+	}
+	if got := messaging.FlightAwareDiversion(nil); got != nil {
+		t.Fatalf("FlightAwareDiversion(nil) = %#v, want nil", got)
 	}
 }

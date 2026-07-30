@@ -7,6 +7,8 @@ import (
 	adsbdb "github.com/nint8835/go-adsbdb"
 
 	"github.com/nint8835/planespotter/pkg/ccar"
+	"github.com/nint8835/planespotter/pkg/diversion"
+	"github.com/nint8835/planespotter/pkg/flightaware"
 	"github.com/nint8835/planespotter/pkg/tar1090"
 )
 
@@ -33,6 +35,66 @@ func airport(airport adsbdb.Airport) string {
 		return code
 	}
 	return fmt.Sprintf("%s (%s)", code, airport.Municipality)
+}
+
+// DiversionInfo is a rendered diversion ready to show in a Discord embed. It is
+// source-agnostic: the geometric heuristic and FlightAware each produce one.
+type DiversionInfo struct {
+	Summary string
+}
+
+func (d *DiversionInfo) summary() string {
+	if d == nil {
+		return ""
+	}
+	return d.Summary
+}
+
+// GeometricDiversion renders a diversion inferred from an aircraft's position
+// relative to its filed route, or returns nil when there is none.
+func GeometricDiversion(diverting *diversion.Diversion) *DiversionInfo {
+	if diverting == nil {
+		return nil
+	}
+
+	return &DiversionInfo{
+		Summary: fmt.Sprintf(
+			"At %d ft, %.0f nm from the nearest airport on its filed route: %s",
+			diverting.AltitudeFeet,
+			diverting.DistanceNM,
+			airport(diverting.NearestAirport),
+		),
+	}
+}
+
+// FlightAwareDiversion renders a diversion reported by FlightAware, or returns nil
+// when the flight is missing or not diverted.
+func FlightAwareDiversion(flight *flightaware.Flight) *DiversionInfo {
+	if flight == nil || !flight.Diverted {
+		return nil
+	}
+
+	summary := "FlightAware reports this flight as diverted"
+	if filed := flightawareRoute(flight); filed != "" {
+		summary += ", filed " + filed
+	}
+
+	return &DiversionInfo{Summary: summary}
+}
+
+func flightawareRoute(flight *flightaware.Flight) string {
+	origin := flight.Origin.Label()
+	destination := flight.Destination.Label()
+	switch {
+	case origin != "" && destination != "":
+		return origin + " -> " + destination
+	case destination != "":
+		return "to " + destination
+	case origin != "":
+		return "from " + origin
+	default:
+		return ""
+	}
 }
 
 func airline(route *adsbdb.FlightRoute) string {

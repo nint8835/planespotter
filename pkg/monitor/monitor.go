@@ -15,6 +15,8 @@ import (
 
 	"github.com/nint8835/planespotter/pkg/ccar"
 	"github.com/nint8835/planespotter/pkg/config"
+	"github.com/nint8835/planespotter/pkg/diversion"
+	"github.com/nint8835/planespotter/pkg/flightaware"
 	"github.com/nint8835/planespotter/pkg/messaging"
 	"github.com/nint8835/planespotter/pkg/planespotters"
 	"github.com/nint8835/planespotter/pkg/tar1090"
@@ -24,22 +26,43 @@ const userAgent = "planespotter (+https://github.com/nint8835/planespotter)"
 
 var errFetchAircraft = errors.New("fetch aircraft")
 
+// flightAwareRecheckInterval is how long the monitor waits before asking
+// FlightAware about an aircraft again. A diversion can begin mid-flight, so an
+// aircraft has to be rechecked, but AeroAPI is billed per query, so it is not
+// rechecked on every fetch.
+const flightAwareRecheckInterval = 5 * time.Minute
+
 // Monitor periodically fetches tar1090 aircraft data and posts newly-seen aircraft.
 type Monitor struct {
 	cfg          config.Config
 	adsbdb       aircraftLookupClient
 	ccar         ccarLookupClient
 	photos       aircraftPhotoClient
+	flightaware  flightAwareClient
 	client       *tar1090.Client
 	messages     aircraftMessageSender
 	seenAircraft map[string]time.Time
 	pending      map[string]pendingAircraft
+	tracked      map[string]trackedAircraft
 }
 
 type pendingAircraft struct {
 	aircraft tar1090.Aircraft
 	receives int
 	lastSeen time.Time
+}
+
+// trackedAircraft is in-memory state for an aircraft the monitor has looked at. It
+// caches the aircraft's filed route, which does not change over a flight, so that
+// checking for a diversion on every fetch does not repeat the route lookup, and
+// records that its diversion has been posted so it is not posted twice.
+type trackedAircraft struct {
+	callsign             string
+	route                *adsbdb.FlightRoute
+	routeFetched         bool
+	diversionPosted      bool
+	flightAwareChecked   bool
+	lastFlightAwareCheck time.Time
 }
 
 type aircraftLookupClient interface {
@@ -49,6 +72,10 @@ type aircraftLookupClient interface {
 
 type ccarLookupClient interface {
 	Lookup(ctx context.Context, registration string, modeSHex string) (*ccar.Record, error)
+}
+
+type flightAwareClient interface {
+	CurrentFlight(ctx context.Context, ident string, identType flightaware.IdentType) (*flightaware.Flight, error)
 }
 
 type aircraftMessageSender interface {
@@ -101,6 +128,21 @@ func WithCCARClient(client interface {
 		}
 
 		m.ccar = client
+		return nil
+	}
+}
+
+// WithFlightAwareClient configures the FlightAware client used to authoritatively
+// detect diversions.
+func WithFlightAwareClient(client interface {
+	CurrentFlight(ctx context.Context, ident string, identType flightaware.IdentType) (*flightaware.Flight, error)
+}) Option {
+	return func(m *Monitor) error {
+		if client == nil {
+			return fmt.Errorf("flightaware client is nil")
+		}
+
+		m.flightaware = client
 		return nil
 	}
 }
@@ -171,14 +213,28 @@ func New(cfg config.Config, opts ...Option) (*Monitor, error) {
 		}
 	}
 
+	var flightAwareClient flightAwareClient
+	if cfg.FlightAwareAPIKey != "" {
+		client, err := flightaware.NewClient(
+			cfg.FlightAwareAPIKey,
+			flightaware.WithUserAgent(userAgent),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create flightaware client: %w", err)
+		}
+		flightAwareClient = client
+	}
+
 	monitor := &Monitor{
-		cfg:      cfg,
-		adsbdb:   adsbdbClient,
-		ccar:     ccarClient,
-		photos:   photoClient,
-		client:   client,
-		messages: messageSender,
-		pending:  map[string]pendingAircraft{},
+		cfg:         cfg,
+		adsbdb:      adsbdbClient,
+		ccar:        ccarClient,
+		photos:      photoClient,
+		flightaware: flightAwareClient,
+		client:      client,
+		messages:    messageSender,
+		pending:     map[string]pendingAircraft{},
+		tracked:     map[string]trackedAircraft{},
 	}
 	for _, opt := range opts {
 		if opt == nil {
@@ -276,7 +332,15 @@ func (m *Monitor) FetchAndCheck(ctx context.Context) error {
 				m.seenAircraft[aircraft.Hex] = lastSeen
 				seenAircraftChanged = true
 			}
-			m.logIgnoredAircraft(ctx, aircraft, "already_seen")
+			// An already-seen aircraft is not posted again for being spotted, but it
+			// may since have begun to divert.
+			posted, err := m.checkDiversion(ctx, aircraft, lastSeen)
+			if err != nil {
+				return err
+			}
+			if !posted {
+				m.logIgnoredAircraft(ctx, aircraft, "already_seen")
+			}
 			continue
 		}
 		if pending, ok := m.pending[aircraft.Hex]; ok {
@@ -343,8 +407,157 @@ func (m *Monitor) FetchAndCheck(ctx context.Context) error {
 	return nil
 }
 
+// checkDiversion posts an already-seen aircraft that has begun to divert, reporting
+// whether it posted. An aircraft's diversion is posted only once, so it does not
+// repost on every fetch for the length of its descent.
+func (m *Monitor) checkDiversion(ctx context.Context, aircraft tar1090.Aircraft, now time.Time) (bool, error) {
+	if m.tracked[aircraft.Hex].diversionPosted {
+		return false, nil
+	}
+
+	diverting, err := m.detectDiversion(ctx, aircraft, now)
+	if err != nil {
+		return false, err
+	}
+	if diverting == nil {
+		return false, nil
+	}
+
+	slog.InfoContext(
+		ctx,
+		"Found possibly diverting aircraft",
+		"hex", aircraft.Hex,
+		"flight", aircraft.Flight,
+		"diversion", diverting.Summary,
+	)
+
+	if err := m.postAircraft(ctx, aircraft, diverting); err != nil {
+		return false, fmt.Errorf("post diverting aircraft %s: %w", aircraft.Hex, err)
+	}
+
+	return true, nil
+}
+
+// detectDiversion reports how an aircraft appears to be diverting, or nil if it is
+// not. When a FlightAware client is configured it is the authority, throttled to
+// flightAwareRecheckInterval per aircraft; the geometric heuristic is used when
+// FlightAware is not configured, is between rechecks, or fails.
+func (m *Monitor) detectDiversion(
+	ctx context.Context,
+	aircraft tar1090.Aircraft,
+	now time.Time,
+) (*messaging.DiversionInfo, error) {
+	if m.flightaware != nil {
+		diverting, ok := m.flightAwareDiversion(ctx, aircraft, now)
+		if ok {
+			return diverting, nil
+		}
+	}
+
+	route, err := m.routeFor(ctx, aircraft)
+	if err != nil {
+		return nil, err
+	}
+	return messaging.GeometricDiversion(diversion.Detect(aircraft, route)), nil
+}
+
+// flightAwareDiversion asks FlightAware whether an aircraft is diverting, reporting
+// ok=false when it declines to answer this cycle (throttled, no airborne flight, or
+// an error) so the caller falls back to the geometric heuristic.
+func (m *Monitor) flightAwareDiversion(
+	ctx context.Context,
+	aircraft tar1090.Aircraft,
+	now time.Time,
+) (*messaging.DiversionInfo, bool) {
+	tracked := m.tracked[aircraft.Hex]
+	if tracked.flightAwareChecked && now.Sub(tracked.lastFlightAwareCheck) < flightAwareRecheckInterval {
+		return nil, false
+	}
+
+	ident, identType := flightAwareIdent(aircraft)
+	if ident == "" {
+		return nil, false
+	}
+
+	tracked.flightAwareChecked = true
+	tracked.lastFlightAwareCheck = now
+	m.tracked[aircraft.Hex] = tracked
+
+	flight, err := m.flightaware.CurrentFlight(ctx, ident, identType)
+	if err != nil {
+		slog.WarnContext(ctx, "Error looking up FlightAware flight", "hex", aircraft.Hex, "ident", ident, "error", err)
+		return nil, false
+	}
+	if flight == nil {
+		return nil, false
+	}
+
+	return messaging.FlightAwareDiversion(flight), true
+}
+
+// flightAwareIdent picks the most reliable AeroAPI ident for an aircraft, preferring
+// its registration over its callsign.
+func flightAwareIdent(aircraft tar1090.Aircraft) (string, flightaware.IdentType) {
+	if registration := strings.TrimSpace(aircraft.Registration); registration != "" {
+		return registration, flightaware.IdentTypeRegistration
+	}
+	if callsign := strings.TrimSpace(aircraft.Flight); callsign != "" {
+		return callsign, flightaware.IdentTypeDesignator
+	}
+	return "", ""
+}
+
+func (m *Monitor) markDiversionPosted(hex string) {
+	tracked := m.tracked[hex]
+	tracked.diversionPosted = true
+	m.tracked[hex] = tracked
+}
+
+// routeFor returns an aircraft's filed route, looking it up only the first time it
+// is needed for a given callsign.
+func (m *Monitor) routeFor(ctx context.Context, aircraft tar1090.Aircraft) (*adsbdb.FlightRoute, error) {
+	callsign := strings.TrimSpace(aircraft.Flight)
+	if callsign == "" {
+		return nil, nil
+	}
+
+	tracked := m.tracked[aircraft.Hex]
+	if tracked.routeFetched && tracked.callsign == callsign {
+		return tracked.route, nil
+	}
+
+	route, err := m.flightRoute(ctx, aircraft)
+	if err != nil {
+		slog.WarnContext(
+			ctx,
+			"Error looking up flight route",
+			"hex", aircraft.Hex,
+			"callsign", callsign,
+			"error", err,
+		)
+
+		// Only adsbdb answering that it knows no route for the callsign is cached. A
+		// transient failure must not disable diversion checks for the rest of the
+		// flight, so it is left to be retried on the next fetch.
+		if !errors.Is(err, adsbdb.ErrNotFound) {
+			return nil, nil
+		}
+	}
+
+	tracked.callsign = callsign
+	tracked.route = route
+	tracked.routeFetched = true
+	m.tracked[aircraft.Hex] = tracked
+
+	return route, nil
+}
+
 func (m *Monitor) postAndMarkSeen(ctx context.Context, aircraft tar1090.Aircraft, lastSeen time.Time) error {
-	if err := m.postAircraft(ctx, aircraft); err != nil {
+	diverting, err := m.detectDiversion(ctx, aircraft, lastSeen)
+	if err != nil {
+		return err
+	}
+	if err := m.postAircraft(ctx, aircraft, diverting); err != nil {
 		return fmt.Errorf("post aircraft %s: %w", aircraft.Hex, err)
 	}
 
@@ -463,7 +676,14 @@ func (m *Monitor) aircraftMaxAltitudeIgnoreReason(aircraft tar1090.Aircraft) (st
 	}
 }
 
-func (m *Monitor) postAircraft(ctx context.Context, aircraft tar1090.Aircraft) error {
+// postAircraft posts an aircraft with an already-determined diversion (nil if it is
+// not diverting), so that detecting the diversion — which may involve a paid
+// FlightAware query — is never repeated to render the message.
+func (m *Monitor) postAircraft(
+	ctx context.Context,
+	aircraft tar1090.Aircraft,
+	diverting *messaging.DiversionInfo,
+) error {
 	details, err := m.adsbdb.Aircraft(ctx, aircraft.Hex)
 	var detailsPtr *adsbdb.Aircraft
 	if err != nil {
@@ -474,7 +694,7 @@ func (m *Monitor) postAircraft(ctx context.Context, aircraft tar1090.Aircraft) e
 
 	ccarRecord := m.ccarAircraft(ctx, aircraft, detailsPtr)
 
-	route, err := m.flightRoute(ctx, aircraft)
+	route, err := m.routeFor(ctx, aircraft)
 	if err != nil {
 		return err
 	}
@@ -486,11 +706,18 @@ func (m *Monitor) postAircraft(ctx context.Context, aircraft tar1090.Aircraft) e
 		Details:           detailsPtr,
 		CCAR:              ccarRecord,
 		Route:             route,
+		Diversion:         diverting,
 		ImageURL:          photo.URL,
 		ImageCopyright:    photo.Copyright,
 		ImageCopyrightURL: photo.Link,
 	}); err != nil {
 		return fmt.Errorf("send aircraft message: %w", err)
+	}
+
+	// Recorded whatever the reason for the post, so that an aircraft posted as a new
+	// spot while already diverting is not immediately posted again as a diversion.
+	if diverting != nil {
+		m.markDiversionPosted(aircraft.Hex)
 	}
 
 	return nil
@@ -554,24 +781,12 @@ func hasADSBDBPhoto(details *adsbdb.Aircraft) bool {
 }
 
 func (m *Monitor) flightRoute(ctx context.Context, aircraft tar1090.Aircraft) (*adsbdb.FlightRoute, error) {
-	callsign := strings.TrimSpace(aircraft.Flight)
-	if callsign == "" {
-		return nil, nil
-	}
-
-	route, err := m.adsbdb.Callsign(ctx, callsign)
+	route, err := m.adsbdb.Callsign(ctx, strings.TrimSpace(aircraft.Flight))
 	if err != nil {
-		slog.WarnContext(
-			ctx,
-			"Error looking up flight route",
-			"hex", aircraft.Hex,
-			"callsign", callsign,
-			"error", err,
-		)
-		return nil, nil
+		return nil, err
 	}
 
-	correctAirline(callsign, &route)
+	correctAirline(strings.TrimSpace(aircraft.Flight), &route)
 
 	return &route, nil
 }

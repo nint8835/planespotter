@@ -72,6 +72,35 @@ type Aircraft struct {
 	RSSI              *float64           `json:"rssi,omitempty"`
 }
 
+// Altitude returns the aircraft's altitude in feet, preferring the barometric
+// value and falling back to the geometric one. It reports false when the aircraft
+// is on the ground or no altitude is known.
+func (a Aircraft) Altitude() (int, bool) {
+	if a.AltitudeBaro.Ground {
+		return 0, false
+	}
+	if a.AltitudeBaro.Feet != nil {
+		return *a.AltitudeBaro.Feet, true
+	}
+	if a.AltitudeGeom != nil {
+		return *a.AltitudeGeom, true
+	}
+	return 0, false
+}
+
+// Position returns the aircraft's latitude and longitude, preferring its live
+// position and falling back to its last known one. It reports false when neither
+// is known.
+func (a Aircraft) Position() (float64, float64, bool) {
+	if a.Latitude != nil && a.Longitude != nil {
+		return *a.Latitude, *a.Longitude, true
+	}
+	if a.LastPosition != nil {
+		return a.LastPosition.Latitude, a.LastPosition.Longitude, true
+	}
+	return 0, 0, false
+}
+
 // Database flags from readsb/tar1090's aircraft database.
 const (
 	DBFlagMilitary = 1 << iota
